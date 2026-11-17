@@ -3,17 +3,14 @@ package mcp
 import (
 	"context"
 	"encoding/json"
-	"sync"
+	"strings"
 	"testing"
 
-	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
-	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/mcpjungle/mcpjungle/internal/model"
 	"github.com/mcpjungle/mcpjungle/internal/telemetry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/datatypes"
 )
 
 func lazyTestService(t *testing.T) *MCPService {
@@ -28,6 +25,10 @@ func lazyTestService(t *testing.T) *MCPService {
 	return service
 }
 
+func devCtx() context.Context {
+	return context.WithValue(context.Background(), "mode", model.ModeDev)
+}
+
 func createLazyTestServer(t *testing.T, service *MCPService, name string) *model.McpServer {
 	t.Helper()
 	serverModel, err := model.NewStdioServer(name, name+" description", "echo", nil, nil, "")
@@ -36,13 +37,14 @@ func createLazyTestServer(t *testing.T, service *MCPService, name string) *model
 	return serverModel
 }
 
-func createLazyTestTool(t *testing.T, service *MCPService, serverModel *model.McpServer, name string, enabled bool) {
+// createLazyTestTool creates a tool in the DB with the original (unprefixed) name.
+func createLazyTestTool(t *testing.T, service *MCPService, serverModel *model.McpServer, originalName string, description string) *model.Tool {
 	t.Helper()
 	schema, err := json.Marshal(map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}}})
 	require.NoError(t, err)
-	tool := &model.Tool{ServerID: serverModel.ID, Name: name, Description: name + " description", InputSchema: schema, Enabled: true}
+	tool := &model.Tool{ServerID: serverModel.ID, Name: originalName, Description: description, InputSchema: schema, Enabled: true}
 	require.NoError(t, service.db.Create(tool).Error)
-	require.NoError(t, service.db.Model(tool).Update("enabled", enabled).Error)
+	return tool
 }
 
 func lazyRequest(name string, arguments map[string]any) mcp.CallToolRequest {
@@ -61,257 +63,193 @@ func lazyResultJSON(t *testing.T, result *mcp.CallToolResult, destination any) {
 	require.NoError(t, json.Unmarshal([]byte(text.Text), destination))
 }
 
-type lazyTestSession struct {
-	id            string
-	initialized   bool
-	notifications chan mcp.JSONRPCNotification
-	tools         map[string]mcpserver.ServerTool
-	mu            sync.RWMutex
+// --- Task 1.1: Exactly two tools exposed ---
+
+func TestLazy_ExposeExactlyTwoMetaTools(t *testing.T) {
+	service := lazyTestService(t)
+	tools := service.lazyMcpProxyServer.ListTools()
+	assert.Len(t, tools, 2)
+	assert.Contains(t, tools, metaToolDescribe)
+	assert.Contains(t, tools, metaToolUse)
 }
 
-func (s *lazyTestSession) Initialize()       { s.initialized = true }
-func (s *lazyTestSession) Initialized() bool { return s.initialized }
-func (s *lazyTestSession) NotificationChannel() chan<- mcp.JSONRPCNotification {
-	return s.notifications
+// --- Task 1.2: describe_tool handler ---
+
+func TestLazy_DescribeTool_KnownTool(t *testing.T) {
+	service := lazyTestService(t)
+	srv := createLazyTestServer(t, service, "alpha")
+	createLazyTestTool(t, service, srv, "greet", "Greets a person by name. Returns a friendly message.")
+	service.rebuildLazyToolDescriptions()
+
+	result, err := service.lazyDescribeToolHandler(devCtx(), lazyRequest(metaToolDescribe, map[string]any{"tool_name": "alpha__greet"}))
+	require.NoError(t, err)
+	var entry map[string]any
+	lazyResultJSON(t, result, &entry)
+	assert.Equal(t, "alpha__greet", entry["name"])
+	assert.Contains(t, entry["description"], "Greets a person")
+	schema, ok := entry["input_schema"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "object", schema["type"])
 }
 
-func (s *lazyTestSession) SessionID() string { return s.id }
+func TestLazy_DescribeTool_UnknownTool(t *testing.T) {
+	service := lazyTestService(t)
+	result, err := service.lazyDescribeToolHandler(devCtx(), lazyRequest(metaToolDescribe, map[string]any{"tool_name": "nope__missing"}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
 
-func (s *lazyTestSession) GetSessionTools() map[string]mcpserver.ServerTool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	result := make(map[string]mcpserver.ServerTool, len(s.tools))
-	for name, tool := range s.tools {
-		result[name] = tool
+func TestLazy_DescribeTool_EmptyName(t *testing.T) {
+	service := lazyTestService(t)
+	result, err := service.lazyDescribeToolHandler(devCtx(), lazyRequest(metaToolDescribe, map[string]any{"tool_name": ""}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
+
+// --- Task 1.3: use_tool handler ---
+
+func TestLazy_UseTool_InvalidName(t *testing.T) {
+	service := lazyTestService(t)
+	result, err := service.lazyUseToolHandler(devCtx(), lazyRequest(metaToolUse, map[string]any{
+		"tool_name": "no-underscore-here",
+		"tool_args": map[string]any{},
+	}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
+
+func TestLazy_UseTool_UnknownServer(t *testing.T) {
+	service := lazyTestService(t)
+	result, err := service.lazyUseToolHandler(devCtx(), lazyRequest(metaToolUse, map[string]any{
+		"tool_name": "ghost__tool",
+		"tool_args": map[string]any{},
+	}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
+
+func TestLazy_UseTool_DisabledTool(t *testing.T) {
+	service := lazyTestService(t)
+	srv := createLazyTestServer(t, service, "alpha")
+	tool := createLazyTestTool(t, service, srv, "greet", "Greets someone.")
+	// Disable the tool
+	require.NoError(t, service.db.Model(tool).Update("enabled", false).Error)
+
+	result, err := service.lazyUseToolHandler(devCtx(), lazyRequest(metaToolUse, map[string]any{
+		"tool_name": "alpha__greet",
+		"tool_args": map[string]any{},
+	}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
+
+// --- Task 2.1: firstSentence and buildUseToolDescription ---
+
+func TestFirstSentence_Normal(t *testing.T) {
+	assert.Equal(t, "Does a thing.", firstSentence("Does a thing. Then more."))
+}
+
+func TestFirstSentence_NoPeriod(t *testing.T) {
+	assert.Equal(t, "No period here", firstSentence("No period here"))
+}
+
+func TestFirstSentence_Abbreviation(t *testing.T) {
+	// ". b" is lowercase so skipped; ". P" matches -> cuts after "service."
+	assert.Equal(t, "U.S. based service.", firstSentence("U.S. based service. Provides data."))
+}
+
+func TestFirstSentence_Newline(t *testing.T) {
+	assert.Equal(t, "First line.", firstSentence("First line.\nSecond line."))
+}
+
+func TestFirstSentence_CRLFNewline(t *testing.T) {
+	assert.Equal(t, "First line.", firstSentence("First line.\r\nSecond line."))
+}
+
+func TestFirstSentence_PeriodSpaceLowercase(t *testing.T) {
+	// ". a" is lowercase so no match; full string returned
+	assert.Equal(t, "No capital after period. all lowercase rest.", firstSentence("No capital after period. all lowercase rest."))
+}
+
+func TestFirstSentence_PeriodEndOfString(t *testing.T) {
+	// Period at end of string with nothing after: no match
+	assert.Equal(t, "Just ends here.", firstSentence("Just ends here."))
+}
+
+func TestBuildUseToolDescription_Empty(t *testing.T) {
+	desc := buildUseToolDescription(nil)
+	assert.Contains(t, desc, "(none currently available)")
+}
+
+func TestBuildUseToolDescription_Multiple(t *testing.T) {
+	tools := []model.Tool{
+		{Name: "b__two", Description: "Second tool. More info."},
+		{Name: "a__one", Description: "First tool does things."},
 	}
-	return result
+	desc := buildUseToolDescription(tools)
+	assert.Contains(t, desc, "Available tools:")
+	// Sorted alphabetically
+	idxA := strings.Index(desc, "- a__one")
+	idxB := strings.Index(desc, "- b__two")
+	require.NotEqual(t, -1, idxA)
+	require.NotEqual(t, -1, idxB)
+	assert.Less(t, idxA, idxB)
+	assert.Contains(t, desc, "First tool does things.")
+	assert.Contains(t, desc, "Second tool.")
+	// Contains instructions
+	assert.Contains(t, desc, "mcpjungle__describe_tool")
+	assert.Contains(t, desc, "tool_args")
 }
 
-func (s *lazyTestSession) SetSessionTools(tools map[string]mcpserver.ServerTool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tools = tools
-}
+// --- Task 2.2: Initial description contains one bullet per visible tool ---
 
-func lazyActivationContext(t *testing.T, service *MCPService, ctx context.Context) (context.Context, *lazyTestSession) {
-	t.Helper()
-	session := &lazyTestSession{
-		id:            t.Name(),
-		notifications: make(chan mcp.JSONRPCNotification, 4),
-		tools:         make(map[string]mcpserver.ServerTool),
-	}
-	require.NoError(t, service.LazyMcpProxyServer().RegisterSession(ctx, session))
-	session.Initialize()
-	t.Cleanup(func() { service.LazyMcpProxyServer().UnregisterSession(ctx, session.id) })
-	return service.LazyMcpProxyServer().WithContext(ctx, session), session
-}
-
-// TestLazyProxyServer_RegistersOnlyMetaTools pins the public surface of the
-// lazy proxy: an agent must only see `mcpjungle__list_servers`,
-// `mcpjungle__show_server_tools`, and the `mcpjungle__invoke` fallback for
-// static clients. Upstream tools and the old `mcpjungle__list_tools`
-// meta-tool must not leak through.
-func TestLazyProxyServer_RegistersOnlyMetaTools(t *testing.T) {
+func TestLazy_InitialDescriptionContainsAllTools(t *testing.T) {
 	service := lazyTestService(t)
-	tools := service.LazyMcpProxyServer().ListTools()
-	assert.Len(t, tools, 3)
-	assert.Contains(t, tools, metaToolListServers)
-	assert.Contains(t, tools, metaToolShowServerTools)
-	assert.Contains(t, tools, metaToolInvoke)
-	assert.NotContains(t, tools, "mcpjungle__list_tools")
+	srv1 := createLazyTestServer(t, service, "alpha")
+	createLazyTestTool(t, service, srv1, "one", "First tool. Does stuff.")
+	createLazyTestTool(t, service, srv1, "two", "Second tool.")
+	srv2 := createLazyTestServer(t, service, "beta")
+	createLazyTestTool(t, service, srv2, "three", "Third tool here.")
+
+	service.rebuildLazyToolDescriptions()
+
+	tools := service.lazyMcpProxyServer.ListTools()
+	desc := tools[metaToolUse].Tool.Description
+	assert.Contains(t, desc, "alpha__one")
+	assert.Contains(t, desc, "alpha__two")
+	assert.Contains(t, desc, "beta__three")
 }
 
-func TestLazyProxyServer_InitializeExplainsDiscoveryWorkflow(t *testing.T) {
-	service := lazyTestService(t)
-	client, err := mcpclient.NewInProcessClient(service.LazyMcpProxyServer())
-	require.NoError(t, err)
-	require.NoError(t, client.Start(context.Background()))
-	t.Cleanup(func() { _ = client.Close() })
+// --- Task 2.3: Rebuild updates bullet list on tool change ---
 
-	result, err := client.Initialize(context.Background(), mcp.InitializeRequest{
-		Params: mcp.InitializeParams{
-			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
-			ClientInfo:      mcp.Implementation{Name: "test-client", Version: "1.0.0"},
-		},
-	})
-	require.NoError(t, err)
-	assert.Contains(t, result.Instructions, metaToolListServers)
-	assert.Contains(t, result.Instructions, metaToolShowServerTools)
-	assert.Contains(t, result.Instructions, "Never use a generic MCP context search")
+func TestLazy_RebuildReflectsToolChanges(t *testing.T) {
+	service := lazyTestService(t)
+	srv := createLazyTestServer(t, service, "alpha")
+	tool1 := createLazyTestTool(t, service, srv, "one", "First tool.")
+	createLazyTestTool(t, service, srv, "two", "Second tool.")
+
+	service.rebuildLazyToolDescriptions()
+	tools := service.lazyMcpProxyServer.ListTools()
+	assert.Contains(t, tools[metaToolUse].Tool.Description, "alpha__one")
+	assert.Contains(t, tools[metaToolUse].Tool.Description, "alpha__two")
+
+	// Disable tool1 and rebuild
+	require.NoError(t, service.db.Model(tool1).Update("enabled", false).Error)
+	service.rebuildLazyToolDescriptions()
+	tools = service.lazyMcpProxyServer.ListTools()
+	assert.NotContains(t, tools[metaToolUse].Tool.Description, "alpha__one")
+	assert.Contains(t, tools[metaToolUse].Tool.Description, "alpha__two")
+
+	// Re-enable and rebuild
+	require.NoError(t, service.db.Model(tool1).Update("enabled", true).Error)
+	service.rebuildLazyToolDescriptions()
+	tools = service.lazyMcpProxyServer.ListTools()
+	assert.Contains(t, tools[metaToolUse].Tool.Description, "alpha__one")
 }
 
-// TestLazyDiscovery_ListServersReturnsEveryEnabledServer verifies the happy
-// path: in dev mode every enabled server is listed with its name,
-// description, transport, and the count of enabled tools.
-func TestLazyDiscovery_ListServersReturnsEveryEnabledServer(t *testing.T) {
-	service := lazyTestService(t)
-	alpha := createLazyTestServer(t, service, "alpha")
-	beta := createLazyTestServer(t, service, "beta")
-	disabled := createLazyTestServer(t, service, "gamma")
-	require.NoError(t, service.db.Model(disabled).Update("enabled", false).Error)
+// --- Ensure the lazy server instructions mention the meta-tools ---
 
-	createLazyTestTool(t, service, alpha, "search", true)
-	createLazyTestTool(t, service, alpha, "disabled", false)
-	createLazyTestTool(t, service, beta, "lookup", true)
-
-	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
-	result, err := service.lazyListServersHandler(ctx, lazyRequest(metaToolListServers, nil))
-	require.NoError(t, err)
-
-	var entries []map[string]any
-	lazyResultJSON(t, result, &entries)
-	require.Len(t, entries, 2, "disabled server must be filtered out")
-
-	assert.Equal(t, []string{"alpha", "beta"}, []string{entries[0]["name"].(string), entries[1]["name"].(string)})
-	assert.Equal(t, "alpha description", entries[0]["description"])
-	assert.Equal(t, "beta description", entries[1]["description"])
-	assert.Equal(t, "stdio", entries[0]["transport"])
-	assert.Equal(t, "stdio", entries[1]["transport"])
-
-	assert.EqualValues(t, 1, entries[0]["enabled_tool_count"], "disabled tool must not be counted")
-	assert.EqualValues(t, 1, entries[1]["enabled_tool_count"])
-}
-
-// TestLazyDiscovery_ShowServerToolsRequiresServerArg guarantees we cannot
-// accidentally regress to the old behaviour of dumping every registered tool.
-// Without `server` the handler must reject the call.
-func TestLazyDiscovery_ShowServerToolsRequiresServerArg(t *testing.T) {
-	service := lazyTestService(t)
-	createLazyTestServer(t, service, "alpha")
-	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
-
-	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, nil))
-	require.NoError(t, err)
-	require.True(t, result.IsError, "missing server arg must produce an error result")
-}
-
-// TestLazyDiscovery_ShowServerToolsReturnsOnlyRequestedServer confirms the
-// scoped lookup returns the canonical tool list for one server and ignores
-// others, plus honours the tool's enabled flag.
-func TestLazyDiscovery_ShowServerToolsReturnsOnlyRequestedServer(t *testing.T) {
-	service := lazyTestService(t)
-	alpha := createLazyTestServer(t, service, "alpha")
-	beta := createLazyTestServer(t, service, "beta")
-	createLazyTestTool(t, service, alpha, "search", true)
-	createLazyTestTool(t, service, alpha, "disabled", false)
-	createLazyTestTool(t, service, beta, "lookup", true)
-	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
-	ctx, _ = lazyActivationContext(t, service, ctx)
-
-	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
-	require.NoError(t, err)
-	var tools []map[string]any
-	lazyResultJSON(t, result, &tools)
-
-	require.Len(t, tools, 1, "only alpha__search must be returned; beta must not leak")
-	assert.Equal(t, "alpha__search", tools[0]["name"])
-	assert.NotEmpty(t, tools[0]["input_schema"])
-	assert.NotEmpty(t, tools[0]["description"])
-}
-
-// TestLazyDiscovery_ShowServerToolsUnknownServerReturnsError covers the case
-// where the requested server does not exist at all.
-func TestLazyDiscovery_ShowServerToolsUnknownServerReturnsError(t *testing.T) {
-	service := lazyTestService(t)
-	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
-
-	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "missing"}))
-	require.NoError(t, err)
-	require.True(t, result.IsError)
-}
-
-// TestLazyDiscovery_ListServersEnterpriseAllowList proves the handler honours
-// the enterprise client allow list: an unlisted server must not be returned.
-func TestLazyDiscovery_ListServersEnterpriseAllowList(t *testing.T) {
-	service := lazyTestService(t)
-	alpha := createLazyTestServer(t, service, "alpha")
-	beta := createLazyTestServer(t, service, "beta")
-	createLazyTestTool(t, service, alpha, "search", true)
-	createLazyTestTool(t, service, beta, "lookup", true)
-
-	client := &model.McpClient{
-		Name:      "restricted-client",
-		AllowList: datatypes.JSON(`["alpha"]`),
-	}
-	ctx := context.WithValue(context.Background(), "mode", model.ModeEnterprise)
-	ctx = context.WithValue(ctx, "client", client)
-
-	result, err := service.lazyListServersHandler(ctx, lazyRequest(metaToolListServers, nil))
-	require.NoError(t, err)
-	var entries []map[string]any
-	lazyResultJSON(t, result, &entries)
-	require.Len(t, entries, 1)
-	assert.Equal(t, "alpha", entries[0]["name"])
-}
-
-// TestLazyDiscovery_ShowServerToolsEnterpriseAllowList mirrors the list
-// check for the per-server lookup.
-func TestLazyDiscovery_ShowServerToolsEnterpriseAllowList(t *testing.T) {
-	service := lazyTestService(t)
-	alpha := createLazyTestServer(t, service, "alpha")
-	beta := createLazyTestServer(t, service, "beta")
-	createLazyTestTool(t, service, alpha, "search", true)
-	createLazyTestTool(t, service, beta, "lookup", true)
-
-	client := &model.McpClient{
-		Name:      "restricted-client",
-		AllowList: datatypes.JSON(`["beta"]`),
-	}
-	ctx := context.WithValue(context.Background(), "mode", model.ModeEnterprise)
-	ctx = context.WithValue(ctx, "client", client)
-	ctx, _ = lazyActivationContext(t, service, ctx)
-
-	// alpha is denied
-	denied, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
-	require.NoError(t, err)
-	require.True(t, denied.IsError)
-
-	// beta is allowed
-	allowed, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "beta"}))
-	require.NoError(t, err)
-	var tools []map[string]any
-	lazyResultJSON(t, allowed, &tools)
-	require.Len(t, tools, 1)
-	assert.Equal(t, "beta__lookup", tools[0]["name"])
-}
-
-func TestLazyDiscovery_ShowServerToolsActivatesOnlyCurrentSession(t *testing.T) {
-	service := lazyTestService(t)
-	alpha := createLazyTestServer(t, service, "alpha")
-	beta := createLazyTestServer(t, service, "beta")
-	createLazyTestTool(t, service, alpha, "search", true)
-	createLazyTestTool(t, service, beta, "lookup", true)
-
-	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
-	ctx, session := lazyActivationContext(t, service, ctx)
-	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
-	require.NoError(t, err)
-	require.False(t, result.IsError)
-
-	tools := session.GetSessionTools()
-	require.Contains(t, tools, "alpha__search")
-	assert.NotContains(t, tools, "beta__lookup")
-	assert.Equal(t, "alpha__search", tools["alpha__search"].Tool.Name)
-	require.Equal(t, "notifications/tools/list_changed", (<-session.notifications).Method)
-
-	result, err = service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
-	require.NoError(t, err)
-	require.False(t, result.IsError)
-	assert.Len(t, session.GetSessionTools(), 1, "re-activation must not duplicate tools")
-
-	result, err = service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "beta"}))
-	require.NoError(t, err)
-	require.False(t, result.IsError)
-	assert.Contains(t, session.GetSessionTools(), "beta__lookup")
-}
-
-func TestLazyDiscovery_ShowServerToolsRequiresActiveSession(t *testing.T) {
-	service := lazyTestService(t)
-	alpha := createLazyTestServer(t, service, "alpha")
-	createLazyTestTool(t, service, alpha, "search", true)
-	ctx := context.WithValue(context.Background(), "mode", model.ModeDev)
-
-	result, err := service.lazyShowServerToolsHandler(ctx, lazyRequest(metaToolShowServerTools, map[string]any{"server": "alpha"}))
-	require.NoError(t, err)
-	require.True(t, result.IsError)
+func TestLazy_InstructionsMentionMetaTools(t *testing.T) {
+	assert.Contains(t, lazyMCPInstructions, "mcpjungle__describe_tool")
+	assert.Contains(t, lazyMCPInstructions, "mcpjungle__use_tool")
 }

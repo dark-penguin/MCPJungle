@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -14,11 +16,10 @@ import (
 )
 
 const (
-	metaToolListServers     = "mcpjungle__list_servers"
-	metaToolShowServerTools = "mcpjungle__show_server_tools"
-	metaToolInvoke          = "mcpjungle__invoke"
+	metaToolDescribe = "mcpjungle__describe_tool"
+	metaToolUse      = "mcpjungle__use_tool"
 
-	lazyMCPInstructions = "This is a lazy MCP gateway. Before saying an MCP server or tool is unavailable, call mcpjungle__list_servers to discover the registered services. When a task needs one of those services, call mcpjungle__show_server_tools with its exact server name. That activates the selected service's canonical tools in this session. Call an activated tool directly after tools/list_changed. If the client does not dynamically expose the activated tools, call mcpjungle__invoke with the canonical tool name and JSON arguments instead. Never use a generic MCP context search as a substitute for this discovery flow."
+	lazyMCPInstructions = "This is a lazy MCP gateway with two meta-tools: `mcpjungle__describe_tool` returns the input schema for a given tool name; `mcpjungle__use_tool` invokes a tool. The `mcpjungle__use_tool` description lists all available tools and shows the exact call format. Always describe before you invoke."
 )
 
 type lazyContextKey string
@@ -49,210 +50,134 @@ func newLazyMCPServer() *server.MCPServer {
 	)
 }
 
-// initializeLazyHandlers registers the fixed lazy tool set once at startup.
-//
-// The lazy proxy exposes exactly two meta-tools so an agent has a clear,
-// two-step discovery workflow:
-//
-//  1. Call `mcpjungle__list_servers` to discover every enabled MCP server the
-//     caller is allowed to see (no upstream connection is opened). The
-//     response includes each server's description and the count of enabled
-//     tools it provides, so the agent can decide whether to drill in.
-//  2. Call `mcpjungle__show_server_tools` with the chosen `server` to fetch
-//     and activate the full tool list (name, description, input_schema) for
-//     that one server. The canonical `server__tool` names are added only to
-//     the current MCP session and can then be invoked directly.
-//
-// Neither meta-tool opens an upstream session. Activating a server changes only
-// the current client session and is safe to repeat.
+// initializeLazyHandlers registers the two fixed lazy meta-tools and sets
+// use_tool's description to the current bullet-list catalog.
 func (m *MCPService) initializeLazyHandlers() {
-	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
-		metaToolListServers,
-		mcp.WithDescription(
-			"FIRST STEP. Call `mcpjungle__list_servers` to discover the enabled MCP servers "+
-				"available through MCPJungle. Returns one entry per enabled server with the server "+
-				"name, a short description, the transport, and the count of enabled tools. "+
-				"Never opens an upstream connection. Pick a server from the response, then call "+
-				"`mcpjungle__show_server_tools` with `server=<name>` to fetch its tools. "+
-				"Do not guess server names \u2014 only names returned here are valid.",
-		),
-	), m.lazyListServersHandler)
-	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
-		metaToolShowServerTools,
-		mcp.WithDescription(
-			"SECOND STEP. Call `mcpjungle__show_server_tools` after `mcpjungle__list_servers` "+
-				"to activate the tools for a single MCP server in this MCP session. The `server` argument "+
-				"is REQUIRED and must be a server name copied verbatim from a `mcpjungle__list_servers` "+
-				"result. It returns each tool's canonical `server__tool` name, description, and input schema, "+
-				"then sends a tools/list_changed notification so those canonical tools can be invoked directly. "+
-				"Do NOT call this tool without `server` — it is intentionally rejected to avoid "+
-				"dumping every registered tool into context.",
-		),
-		mcp.WithString("server", mcp.Required(),
-			mcp.Description("MCP server name copied verbatim from a `mcpjungle__list_servers` result. Required."),
-		),
-	), m.lazyShowServerToolsHandler)
-	m.lazyMcpProxyServer.AddTool(mcp.NewTool(
-		metaToolInvoke,
-		mcp.WithDescription(
-			"FALLBACK ONLY. Invoke an enabled, authorized canonical `server__tool` when the MCP client does not dynamically expose tools activated by mcpjungle__show_server_tools. Call show_server_tools first to obtain the exact tool name and schema. Pass `arguments` as a JSON object string matching that schema.",
-		),
-		mcp.WithString("name", mcp.Required(), mcp.Description("Canonical tool name returned by mcpjungle__show_server_tools.")),
-		mcp.WithString("arguments", mcp.Required(), mcp.Description("JSON object string matching the selected tool's input schema.")),
-	), m.lazyInvokeHandler)
+	m.rebuildLazyToolDescriptions()
 }
 
-// lazyListServersHandler returns the enabled MCP servers the caller can see.
-//
-// It applies the same enterprise allow-list enforcement as the eager proxy
-// (via `authorizeProxyServerAccess`) and, for tool-group requests, hides
-// servers whose tools are not exposed by the group. Disabled servers are
-// filtered at the SQL level by `ListEnabledMcpServers`. The response never
-// opens an upstream connection.
-func (m *MCPService) lazyListServersHandler(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	allowed, err := m.lazyAllowedTools(ctx)
+// rebuildLazyToolDescriptions regenerates the bullet-list catalog from the
+// current set of visible enabled tools and updates the lazy server's
+// use_tool description. Safe to call concurrently; uses the mcp-go
+// SetTools API which is internally locked.
+func (m *MCPService) rebuildLazyToolDescriptions() {
+	tools, err := m.ListTools()
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		log.Printf("[WARN] rebuildLazyToolDescriptions: failed to list tools: %v", err)
+		return
 	}
 
-	servers, err := m.ListEnabledMcpServers()
-	if err != nil {
-		return mcp.NewToolResultErrorf("failed to list MCP servers: %v", err), nil
-	}
-
-	// Pre-compute the enabled tool count per server in one query so this
-	// handler stays O(N servers) regardless of how many tools exist.
-	type toolCountRow struct {
-		ServerID uint `gorm:"column:server_id"`
-		Count    int  `gorm:"column:c"`
-	}
-	var counts []toolCountRow
-	if err := m.db.Model(&model.Tool{}).
-		Select("server_id, COUNT(*) AS c").
-		Where("enabled = ?", true).
-		Group("server_id").
-		Scan(&counts).Error; err != nil {
-		return mcp.NewToolResultErrorf("failed to count tools: %v", err), nil
-	}
-	countByServer := make(map[uint]int, len(counts))
-	for _, row := range counts {
-		countByServer[row.ServerID] = row.Count
-	}
-
-	result := make([]map[string]any, 0, len(servers))
-	for _, s := range servers {
-		if err := authorizeProxyServerAccess(ctx, s.Name); err != nil {
-			continue
-		}
-		// For tool-group requests, hide servers that contribute no tools
-		// to the group (mirrors the filter applied by `authorizeLazyServer`).
-		if lazyGroupFromContext(ctx) != "" {
-			hasGroupTool := false
-			for toolName := range allowed {
-				parent, _, _ := splitServerToolName(toolName)
-				if parent == s.Name {
-					hasGroupTool = true
-					break
-				}
-			}
-			if !hasGroupTool {
-				continue
-			}
-		}
-
-		entry := map[string]any{
-			"name":               s.Name,
-			"description":        truncateDescription(s.Description, 140),
-			"transport":          string(s.Transport),
-			"enabled_tool_count": countByServer[s.ID],
-		}
-		result = append(result, entry)
-	}
-
-	sort.Slice(result, func(i, j int) bool { return result[i]["name"].(string) < result[j]["name"].(string) })
-	return lazyJSONResult(result)
-}
-
-// lazyShowServerToolsHandler activates the enabled tools for one MCP server in
-// the current session and returns their metadata as confirmation.
-//
-// `server` is required. Without it we return an explicit error pointing the
-// agent at `mcpjungle__list_servers`, instead of dumping the global tool
-// list. The handler authorizes the server through `authorizeLazyServer` and
-// applies `lazyAllowedTools` for tool-group requests.
-func (m *MCPService) lazyShowServerToolsHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	clientSession := server.ClientSessionFromContext(ctx)
-	if clientSession == nil {
-		return mcp.NewToolResultError("lazy tool activation requires an active MCP session"), nil
-	}
-
-	serverName := strings.TrimSpace(req.GetString("server", ""))
-	if serverName == "" {
-		return mcp.NewToolResultError(
-			"`server` is required. Call mcpjungle__list_servers first to discover the available servers.",
-		), nil
-	}
-
-	if err := m.authorizeLazyServer(ctx, serverName); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	tools, err := m.ListToolsByServer(serverName)
-	if err != nil {
-		return mcp.NewToolResultErrorf("failed to list tools for %s: %v", serverName, err), nil
-	}
-
-	allowed, err := m.lazyAllowedTools(ctx)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	result := make([]map[string]any, 0, len(tools))
-	sessionTools := make([]server.ServerTool, 0, len(tools))
+	var visible []model.Tool
 	for _, tool := range tools {
-		if !tool.Enabled || !allowed[tool.Name] {
+		if !tool.Enabled {
 			continue
 		}
-		mcpTool, err := convertToolModelToMcpObject(&tool)
-		if err != nil {
-			return mcp.NewToolResultErrorf("failed to prepare tool %s: %v", tool.Name, err), nil
+		parent, _, ok := splitServerToolName(tool.Name)
+		if !ok {
+			continue
 		}
-		sessionTools = append(sessionTools, server.ServerTool{
-			Tool:    mcpTool,
-			Handler: m.MCPProxyToolCallHandler,
-		})
-		result = append(result, lazyToolMetadata(tool))
+		srv, err := m.GetMcpServer(parent)
+		if err != nil || !srv.Enabled {
+			continue
+		}
+		visible = append(visible, tool)
 	}
-	if err := m.lazyMcpProxyServer.AddSessionTools(clientSession.SessionID(), sessionTools...); err != nil {
-		return mcp.NewToolResultErrorf("failed to activate tools for %s: %v", serverName, err), nil
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i]["name"].(string) < result[j]["name"].(string) })
-	return lazyJSONResult(result)
+
+	useDesc := buildUseToolDescription(visible)
+
+	m.lazyMcpProxyServer.SetTools(
+		server.ServerTool{
+			Tool: mcp.NewTool(
+				metaToolDescribe,
+				mcp.WithDescription(
+					"Returns the full input schema (JSON Schema) for a single MCP tool. "+
+						"You MUST call this before `mcpjungle__use_tool` to learn the exact arguments a tool expects. "+
+						"Do not invent or guess argument names.",
+				),
+				mcp.WithString("tool_name", mcp.Required(),
+					mcp.Description("Canonical tool name in the form server__tool.")),
+			),
+			Handler: m.lazyDescribeToolHandler,
+		},
+		server.ServerTool{
+			Tool: mcp.NewTool(
+				metaToolUse,
+				mcp.WithDescription(useDesc),
+				mcp.WithString("tool_name", mcp.Required(),
+					mcp.Description("Canonical tool name in the form server__tool.")),
+				mcp.WithAny("tool_args", mcp.Required(),
+					mcp.Description("JSON object matching the selected tool's input schema. Obtain the schema via `mcpjungle__describe_tool` first.")),
+			),
+			Handler: m.lazyUseToolHandler,
+		},
+	)
 }
 
-// lazyInvokeHandler is a compatibility fallback for MCP clients that receive
-// tools/list_changed but do not add the newly activated tools to their callable
-// registry. It enforces the same enabled-tool and server authorization checks
-// as direct proxy calls before forwarding the request upstream.
-func (m *MCPService) lazyInvokeHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	name := strings.TrimSpace(req.GetString("name", ""))
-	serverName, _, ok := splitServerToolName(name)
-	if !ok {
-		return mcp.NewToolResultError("`name` must be a canonical `server__tool` name returned by mcpjungle__show_server_tools"), nil
-	}
-	if err := m.authorizeLazyServer(ctx, serverName); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+// lazyDescribeToolHandler looks up a tool by canonical name and returns its
+// full original entry (name, description, input schema) as JSON text.
+func (m *MCPService) lazyDescribeToolHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name := strings.TrimSpace(req.GetString("tool_name", ""))
+	if name == "" {
+		return mcp.NewToolResultError("`tool_name` is required"), nil
 	}
 
 	tool, err := m.GetTool(name)
 	if err != nil || !tool.Enabled {
-		return mcp.NewToolResultErrorf("MCP tool %s is unavailable", name), nil
+		return mcp.NewToolResultErrorf("MCP tool %s not found or disabled", name), nil
 	}
 
-	var arguments map[string]any
-	if err := json.Unmarshal([]byte(req.GetString("arguments", "")), &arguments); err != nil {
-		return mcp.NewToolResultErrorf("`arguments` must be a JSON object: %v", err), nil
+	parent, _, ok := splitServerToolName(name)
+	if !ok {
+		return mcp.NewToolResultErrorf("MCP tool %s has an invalid canonical name", name), nil
 	}
+	srv, err := m.GetMcpServer(parent)
+	if err != nil || !srv.Enabled {
+		return mcp.NewToolResultErrorf("MCP server %s is unavailable", parent), nil
+	}
+
+	var schema any = map[string]any{}
+	if len(tool.InputSchema) > 0 {
+		_ = json.Unmarshal(tool.InputSchema, &schema)
+	}
+
+	entry := map[string]any{
+		"name":         tool.Name,
+		"description":  tool.Description,
+		"input_schema": schema,
+	}
+	return lazyJSONResult(entry)
+}
+
+// lazyUseToolHandler authorizes and routes a tool invocation to the correct
+// upstream server via the existing MCPProxyToolCallHandler.
+func (m *MCPService) lazyUseToolHandler(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	name := strings.TrimSpace(req.GetString("tool_name", ""))
+	if name == "" {
+		return mcp.NewToolResultError("`tool_name` is required"), nil
+	}
+
+	serverName, _, ok := splitServerToolName(name)
+	if !ok {
+		return mcp.NewToolResultError("`tool_name` must be a canonical `server__tool` name"), nil
+	}
+
+	if err := m.authorizeLazyServer(ctx, serverName); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	allowed, err := m.lazyAllowedTools(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if !allowed[name] {
+		return mcp.NewToolResultErrorf("MCP tool %s is not available", name), nil
+	}
+
+	arguments, ok := req.GetArguments()["tool_args"].(map[string]any)
+	if !ok {
+		return mcp.NewToolResultError("`tool_args` must be a JSON object matching the tool's input schema"), nil
+	}
+
 	result, err := m.MCPProxyToolCallHandler(ctx, mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: arguments}})
 	if err != nil {
 		return nil, err
@@ -294,8 +219,7 @@ func (m *MCPService) lazyAllowedTools(ctx context.Context) (map[string]bool, err
 
 // authorizeLazyServer confirms a server exists, is enabled, is accessible to
 // the caller under the enterprise allow list, and (for tool-group requests)
-// contributes at least one allowed tool. Used by `lazyShowServerToolsHandler`
-// and `lazyListServersHandler`.
+// contributes at least one allowed tool.
 func (m *MCPService) authorizeLazyServer(ctx context.Context, serverName string) error {
 	serverModel, err := m.GetMcpServer(serverName)
 	if err != nil || !serverModel.Enabled {
@@ -317,12 +241,58 @@ func (m *MCPService) authorizeLazyServer(ctx context.Context, serverName string)
 	return fmt.Errorf("MCP server %s is unavailable in this tool group", serverName)
 }
 
-func lazyToolMetadata(tool model.Tool) map[string]any {
-	var schema any = map[string]any{}
-	if len(tool.InputSchema) > 0 {
-		_ = json.Unmarshal(tool.InputSchema, &schema)
+var sentenceEndRe = regexp.MustCompile(`\.(?:\r?\n| [A-Z])`)
+
+// firstSentence extracts the first sentence from a description. It cuts at
+// the first period followed by a newline, or by a space followed by an
+// uppercase letter. If no such marker exists, the full description is
+// returned unchanged.
+func firstSentence(desc string) string {
+	m := sentenceEndRe.FindStringIndex(desc)
+	if m == nil {
+		return desc
 	}
-	return map[string]any{"name": tool.Name, "description": tool.Description, "input_schema": schema}
+	return desc[:m[0]+1]
+}
+
+// buildUseToolDescription renders the use_tool description: clear calling
+// instructions, a concrete example, and the sorted bullet-list catalog of
+// every visible enabled tool.
+func buildUseToolDescription(tools []model.Tool) string {
+	var sb strings.Builder
+
+	sb.WriteString("Invoke an upstream MCP tool. For each tool in the list below, call this tool like this:\n")
+	sb.WriteString("  mcpjungle__use_tool({\"tool_name\": \"<server>__<tool>\", \"tool_args\": {...}})\n")
+	sb.WriteString("You MUST first call `mcpjungle__describe_tool` with the tool name to get its input schema. Do not invent or guess argument names.\n")
+	sb.WriteString("Example:\n")
+	sb.WriteString("  mcpjungle__use_tool({\"tool_name\": \"github__create_issue\", \"tool_args\": {\"owner\": \"me\", \"repo\": \"x\", \"title\": \"Bug: something\"}})\n")
+	sb.WriteString("\nAvailable tools:\n")
+
+	if len(tools) == 0 {
+		sb.WriteString("(none currently available)\n")
+		return strings.TrimRight(sb.String(), "\n")
+	}
+
+	names := make([]string, 0, len(tools))
+	for _, t := range tools {
+		names = append(names, t.Name)
+	}
+	sort.Strings(names)
+
+	byName := make(map[string]model.Tool, len(tools))
+	for _, t := range tools {
+		byName[t.Name] = t
+	}
+
+	for _, name := range names {
+		sb.WriteString("- ")
+		sb.WriteString(name)
+		sb.WriteString(": ")
+		sb.WriteString(firstSentence(byName[name].Description))
+		sb.WriteString("\n")
+	}
+
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func lazyJSONResult(value any) (*mcp.CallToolResult, error) {
@@ -331,16 +301,4 @@ func lazyJSONResult(value any) (*mcp.CallToolResult, error) {
 		return nil, err
 	}
 	return mcp.NewToolResultText(string(data)), nil
-}
-
-// truncateDescription shortens a server description so the list_servers
-// response stays compact. Empty descriptions pass through unchanged.
-func truncateDescription(desc string, max int) string {
-	if desc == "" {
-		return ""
-	}
-	if len(desc) <= max {
-		return desc
-	}
-	return desc[:max-1] + "\u2026"
 }
