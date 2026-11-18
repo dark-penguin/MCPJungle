@@ -33,16 +33,12 @@ type ToolAdditionCallback func(toolName string) error
 // its name will be set to "git__commit".
 func (m *MCPService) ListTools() ([]model.Tool, error) {
 	var tools []model.Tool
-	if err := m.db.Find(&tools).Error; err != nil {
+	if err := m.db.Preload("Server").Find(&tools).Error; err != nil {
 		return nil, err
 	}
 	// prepend server name to tool names to ensure we only return the unique names of tools to user
 	for i := range tools {
-		var s model.McpServer
-		if err := m.db.First(&s, "id = ?", tools[i].ServerID).Error; err != nil {
-			return nil, fmt.Errorf("failed to get server for tool %s: %w", tools[i].Name, err)
-		}
-		tools[i].Name = mergeServerToolNames(s.Name, tools[i].Name)
+		tools[i].Name = mergeServerToolNames(tools[i].Server.Name, tools[i].Name)
 	}
 	return tools, nil
 }
