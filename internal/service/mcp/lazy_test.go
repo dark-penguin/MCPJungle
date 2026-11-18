@@ -106,6 +106,25 @@ func TestLazy_DescribeTool_EmptyName(t *testing.T) {
 	assert.True(t, result.IsError)
 }
 
+func TestLazy_DescribeTool_DisabledServer(t *testing.T) {
+	service := lazyTestService(t)
+	srv := createLazyTestServer(t, service, "alpha")
+	createLazyTestTool(t, service, srv, "greet", "Greets someone.")
+	// Disable the server
+	require.NoError(t, service.db.Model(srv).Update("enabled", false).Error)
+
+	result, err := service.lazyDescribeToolHandler(devCtx(), lazyRequest(metaToolDescribe, map[string]any{"tool_name": "alpha__greet"}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
+
+func TestLazy_DescribeTool_UnknownServer(t *testing.T) {
+	service := lazyTestService(t)
+	result, err := service.lazyDescribeToolHandler(devCtx(), lazyRequest(metaToolDescribe, map[string]any{"tool_name": "ghost__tool"}))
+	require.NoError(t, err)
+	assert.True(t, result.IsError)
+}
+
 // --- Task 1.3: use_tool handler ---
 
 func TestLazy_UseTool_InvalidName(t *testing.T) {
