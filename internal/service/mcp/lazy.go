@@ -69,15 +69,11 @@ func (m *MCPService) rebuildLazyToolDescriptions() {
 
 	var visible []model.Tool
 	for _, tool := range tools {
-		if !tool.Enabled {
+		if !tool.Enabled || !tool.Server.Enabled {
 			continue
 		}
-		parent, _, ok := splitServerToolName(tool.Name)
+		_, _, ok := splitServerToolName(tool.Name)
 		if !ok {
-			continue
-		}
-		srv, err := m.GetMcpServer(parent)
-		if err != nil || !srv.Enabled {
 			continue
 		}
 		visible = append(visible, tool)
