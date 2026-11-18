@@ -432,6 +432,7 @@ func (m *MCPService) deleteToolInstances(toolNames ...string) {
 // notifyToolDeletion calls all registered tool deletion callbacks with the given tool names.
 func (m *MCPService) notifyToolDeletion(toolNames ...string) {
 	m.toolDeletionCallback(toolNames...)
+	m.rebuildLazyToolDescriptions()
 }
 
 // notifyToolAddition calls all registered tool addition callbacks with the given tool names.
@@ -442,6 +443,7 @@ func (m *MCPService) notifyToolAddition(toolName string) {
 		// as the tool has already been added successfully
 		log.Printf("[ERROR] tool addition callback failed for tool %s: %v", toolName, err)
 	}
+	m.rebuildLazyToolDescriptions()
 }
 
 // convertToolCallResToAPIRes converts an MCP CallToolResult to types.ToolInvokeResult.
