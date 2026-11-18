@@ -133,6 +133,12 @@ func TestE2E_LazyMode_EnterpriseAllowListEnforced(t *testing.T) {
 	}
 	assert.Contains(t, useDesc, "everything__echo")
 
+	// describe_tool is rejected for a server the caller cannot access.
+	describeRes := callTool(t, denied, "mcpjungle__describe_tool", map[string]any{
+		"tool_name": "everything__echo",
+	})
+	assert.True(t, describeRes.IsError)
+
 	// But use_tool is rejected for a server the caller cannot access.
 	invokeRes := callTool(t, denied, "mcpjungle__use_tool", map[string]any{
 		"tool_name": "everything__echo",

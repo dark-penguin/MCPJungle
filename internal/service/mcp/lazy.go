@@ -121,18 +121,28 @@ func (m *MCPService) lazyDescribeToolHandler(ctx context.Context, req mcp.CallTo
 		return mcp.NewToolResultError("`tool_name` is required"), nil
 	}
 
-	tool, err := m.GetTool(name)
-	if err != nil || !tool.Enabled {
-		return mcp.NewToolResultErrorf("MCP tool %s not found or disabled", name), nil
-	}
-
 	parent, _, ok := splitServerToolName(name)
 	if !ok {
 		return mcp.NewToolResultErrorf("MCP tool %s has an invalid canonical name", name), nil
 	}
-	srv, err := m.GetMcpServer(parent)
-	if err != nil || !srv.Enabled {
-		return mcp.NewToolResultErrorf("MCP server %s is unavailable", parent), nil
+
+	// Authorize access to the server (enterprise allow-list, tool-group scope)
+	if err := m.authorizeLazyServer(ctx, parent); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	// Check that this specific tool is allowed (tool-group filtering)
+	allowed, err := m.lazyAllowedTools(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if !allowed[name] {
+		return mcp.NewToolResultErrorf("MCP tool %s is not available", name), nil
+	}
+
+	tool, err := m.GetTool(name)
+	if err != nil || !tool.Enabled {
+		return mcp.NewToolResultErrorf("MCP tool %s not found or disabled", name), nil
 	}
 
 	var schema any = map[string]any{}
